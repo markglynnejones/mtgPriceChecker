@@ -267,6 +267,13 @@ def main() -> None:
     prev = load_snapshot(args.snapshot)
     prev_cards = (prev.get("cards") or {}) if isinstance(prev, dict) else {}
 
+    prev_suppress_next_no_alerts = False
+    try:
+        prev_suppress_next_no_alerts = bool(prev.get("_meta", {}).get("suppress_next_no_alerts"))
+    except Exception:
+        prev_suppress_next_no_alerts = False
+
+
     prev_was_baseline = False
     try:
         prev_was_baseline = (prev.get("_meta", {}).get("run_type") == "baseline")
@@ -355,6 +362,7 @@ def main() -> None:
             "eur_to_gbp": rate,
             "csv_sha256": csv_hash,
             "run_type": "scheduled",  # will be overwritten to "baseline" when needed
+            "suppress_next_no_alerts": False,
         },
         "cards": {}
     }
@@ -411,6 +419,7 @@ def main() -> None:
 
     if baseline_run:
         current["_meta"]["run_type"] = "baseline"
+        current["_meta"]["suppress_next_no_alerts"] = True
         save_snapshot(args.snapshot, current)
 
         if webhook:
@@ -525,6 +534,11 @@ def main() -> None:
             if prev_was_baseline:
                 print("Previous run was baseline; suppressing 'No alerts today' message.")
             else:
+                # Suppress "No alerts today" exactly once after a baseline, then clear the flag.
+                if prev_suppress_next_no_alerts:
+                    print("Suppressing 'No alerts today' once (post-baseline).")
+                    current["_meta"]["suppress_next_no_alerts"] = False
+                else:
                 discord_post(webhook, header + "\nNo alerts today.")
 
         if weekly_written and weekly_path:
