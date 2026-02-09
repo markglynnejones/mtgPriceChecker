@@ -2,11 +2,13 @@ import argparse
 import json
 import os
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Tuple
 
 import pandas as pd
 import requests
+from zoneinfo import ZoneInfo
 
 
 SCRYFALL_COLLECTION_URL = "https://api.scryfall.com/cards/collection"
@@ -70,6 +72,12 @@ def chunk(items: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
 
 
 def load_snapshot(path: str) -> Dict[str, Any]:
+    """
+    Safe snapshot load:
+    - missing file -> {}
+    - empty file -> {}
+    - invalid json -> {}
+    """
     if not os.path.exists(path):
         return {}
     try:
@@ -88,6 +96,151 @@ def save_snapshot(path: str, data: Dict[str, Any]) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+def eur_to_gbp_rate() -> float | None:
+    """
+    ECB daily FX rates: returns GBP per 1 EUR.
+    """
+    url = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    for node in root.iter():
+        if node.attrib.get("currency") == "GBP":
+            return float(node.attrib["rate"])
+    return None
+
+
+def should_run_now(tz_name: str, run_times_csv: str) -> bool:
+    """
+    If run_times_csv is provided (e.g. "07:00,19:00"), only run at those exact local times.
+    """
+    if not run_times_csv.strip():
+        return True
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz)
+    now_hm = now_local.strftime("%H:%M")
+    allowed = {t.strip() for t in run_times_csv.split(",") if t.strip()}
+    return now_hm in allowed
+
+
+def parse_weekday(s: str) -> int:
+    """
+    MON..SUN -> 0..6
+    """
+    days = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
+    s = (s or "").strip().upper()
+    return days.get(s, 6)  # default Sunday
+
+
+def is_weekly_time(tz_name: str, weekly_day: str, weekly_time: str) -> bool:
+    tz = ZoneInfo(tz_name)
+    now_local = datetime.now(tz)
+    wd_target = parse_weekday(weekly_day)
+    hm_target = (weekly_time or "19:00").strip()
+    return now_local.weekday() == wd_target and now_local.strftime("%H:%M") == hm_target
+
+
+def safe_float(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def write_weekly_summary_csv(
+    out_path: str,
+    cards: Dict[str, Any],
+    rate_gbp_per_eur: float | None,
+    prev_cards: Dict[str, Any],
+) -> None:
+    rows = []
+    for k, info in cards.items():
+        eur = safe_float(info.get("eur"))
+        gbp = (eur * rate_gbp_per_eur) if (eur is not None and rate_gbp_per_eur is not None) else None
+
+        prev_eur = safe_float(prev_cards.get(k, {}).get("eur"))
+        prev_gbp = (prev_eur * rate_gbp_per_eur) if (prev_eur is not None and rate_gbp_per_eur is not None) else None
+
+        delta_eur = (eur - prev_eur) if (eur is not None and prev_eur is not None) else None
+        delta_gbp = (gbp - prev_gbp) if (gbp is not None and prev_gbp is not None) else None
+        pct = ((delta_eur / prev_eur) * 100.0) if (delta_eur is not None and prev_eur not in (None, 0)) else None
+
+        rows.append({
+            "name": info.get("name"),
+            "set": info.get("set"),
+            "collector_number": info.get("collector_number"),
+            "lang": info.get("lang"),
+            "foil_kind": info.get("foil_kind"),
+            "qty": info.get("qty"),
+            "eur": eur,
+            "gbp": gbp,
+            "prev_eur": prev_eur,
+            "prev_gbp": prev_gbp,
+            "delta_eur": delta_eur,
+            "delta_gbp": delta_gbp,
+            "pct_change": pct,
+            "scryfall_uri": info.get("scryfall_uri"),
+            "cardmarket_url": info.get("cardmarket_url"),
+        })
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.sort_values(by=["name", "set", "collector_number", "foil_kind"], inplace=True, kind="mergesort")
+    df.to_csv(out_path, index=False, encoding="utf-8")
+
+
+def build_weekly_digest(
+    curr_cards: Dict[str, Any],
+    prev_cards: Dict[str, Any],
+    rate_gbp_per_eur: float | None,
+    min_price: float,
+    top_n: int = 10,
+) -> str:
+    movers = []
+    for k, info in curr_cards.items():
+        eur = safe_float(info.get("eur"))
+        if eur is None or eur < min_price:
+            continue
+
+        prev_eur = safe_float(prev_cards.get(k, {}).get("eur"))
+        if prev_eur is None or prev_eur <= 0:
+            continue
+
+        delta_eur = eur - prev_eur
+        pct = (delta_eur / prev_eur) * 100.0
+
+        gbp = (eur * rate_gbp_per_eur) if (rate_gbp_per_eur is not None) else None
+        prev_gbp = (prev_eur * rate_gbp_per_eur) if (rate_gbp_per_eur is not None) else None
+        delta_gbp = (gbp - prev_gbp) if (gbp is not None and prev_gbp is not None) else None
+
+        movers.append((pct, delta_eur, delta_gbp, info))
+
+    if not movers:
+        return "📊 **Weekly digest (your collection)**\nNo movers with enough price history to report yet."
+
+    gainers = sorted(movers, key=lambda x: x[0], reverse=True)[:top_n]
+    losers = sorted(movers, key=lambda x: x[0])[:top_n]
+
+    def fmt_line(pct, delta_eur, delta_gbp, info):
+        name = info["name"]
+        tag = f"{info['set'].upper()} #{info['collector_number']} · {info['foil_kind']} · x{info['qty']}"
+        links = " | ".join([u for u in [info.get("scryfall_uri"), info.get("cardmarket_url")] if u])
+        gbp_part = f", £{delta_gbp:+.2f}" if delta_gbp is not None else ""
+        return f"- **{name}** ({tag}) — **{pct:+.0f}%** (€{delta_eur:+.2f}{gbp_part})\n  {links}"
+
+    lines = ["📊 **Weekly digest (your collection)**", "", "**Top gainers**"]
+    for pct, d_eur, d_gbp, info in gainers:
+        lines.append(fmt_line(pct, d_eur, d_gbp, info))
+
+    lines += ["", "**Top losers**"]
+    for pct, d_eur, d_gbp, info in losers:
+        lines.append(fmt_line(pct, d_eur, d_gbp, info))
+
+    return "\n".join(lines)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Path to Moxfield export CSV")
@@ -96,13 +249,22 @@ def main() -> None:
     ap.add_argument("--spike_abs", type=float, default=2.0, help="Spike threshold absolute EUR increase")
     ap.add_argument("--dip_pct", type=float, default=-25.0, help="Dip threshold percent (negative)")
     ap.add_argument("--min_price", type=float, default=1.5, help="Ignore cards below this EUR price")
+    ap.add_argument("--tz", default="Europe/London", help="Timezone for run gating, e.g. Europe/London")
+    ap.add_argument("--run-times", default="07:00,19:00", help="Comma-separated local times to run, e.g. 07:00,19:00")
+    ap.add_argument("--weekly-day", default="SUN", help="Weekly summary day (MON..SUN), default SUN")
+    ap.add_argument("--weekly-time", default="19:00", help="Weekly summary local time, default 19:00")
     args = ap.parse_args()
+
+    # Gate to run times (so you can schedule the workflow hourly).
+    if not should_run_now(args.tz, args.run_times):
+        print("Not a scheduled run time; exiting.")
+        return
 
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
     df = pd.read_csv(args.csv)
-    # Expected columns from your file:
-    # Count, Name, Edition, Collector Number, Language, Foil, Proxy, etc.
+
+    # Expected columns from your Moxfield export:
     required = ["Count", "Name", "Edition", "Collector Number", "Language", "Foil"]
     missing = [c for c in required if c not in df.columns]
     if missing:
@@ -117,7 +279,6 @@ def main() -> None:
     df["set_code"] = df["Edition"].astype(str).str.strip().str.lower()
     df["collector"] = df["Collector Number"].astype(str).str.strip()
 
-    # Group to unique printings/variants (so we don't query duplicates)
     grouped = (
         df.groupby(["set_code", "collector", "lang_code", "foil_kind"], dropna=False)
         .agg(total_qty=("Count", "sum"), name=("Name", "first"))
@@ -143,15 +304,23 @@ def main() -> None:
             "qty": int(row["total_qty"]),
         }
 
-    # Load yesterday snapshot
     prev = load_snapshot(args.snapshot)
+    prev_cards = (prev.get("cards") or {}) if isinstance(prev, dict) else {}
 
-    now = datetime.now(timezone.utc).isoformat()
+    # FX rate (GBP per EUR)
+    rate = None
+    try:
+        rate = eur_to_gbp_rate()
+    except Exception:
+        rate = None
 
-    current: Dict[str, Any] = {"_meta": {"generated_at": now}, "cards": {}}
+    now_utc = datetime.now(timezone.utc)
+    now_iso = now_utc.isoformat()
+
+    current: Dict[str, Any] = {"_meta": {"generated_at": now_iso, "eur_to_gbp": rate}, "cards": {}}
     alerts: List[str] = []
 
-    # Query Scryfall in batches of up to 75
+    # Query Scryfall in batches of up to 75 identifiers
     for batch in chunk(identifiers, 75):
         payload = {"identifiers": batch}
         r = requests.post(SCRYFALL_COLLECTION_URL, json=payload, timeout=60)
@@ -159,7 +328,6 @@ def main() -> None:
         data = r.json()
         cards = data.get("data", [])
 
-        # Build lookup by set|collector|lang
         by_id: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         for c in cards:
             set_code = str(c.get("set", "")).lower()
@@ -173,12 +341,12 @@ def main() -> None:
             lang = ident["lang"]
             c = by_id.get((sc, cn, lang))
             if not c:
-                # Could be a mismatch (promo/variant). We skip silently but record for visibility.
                 continue
 
             prices = c.get("prices", {}) or {}
+            purchase = c.get("purchase_uris") or {}
+            cardmarket_url = purchase.get("cardmarket")
 
-            # We store 3 variants, and later pick based on foil_kind per row
             base_key_prefix = f"{sc}|{cn}|{lang}|"
             for kind in ("nonfoil", "foil", "etched"):
                 k = base_key_prefix + kind
@@ -189,24 +357,19 @@ def main() -> None:
                 current["cards"][k] = {
                     **meta,
                     "scryfall_uri": c.get("scryfall_uri"),
-                    "printed_name": c.get("printed_name"),
+                    "cardmarket_url": cardmarket_url,
                     "eur": eur,
                 }
 
-        time.sleep(0.12)  # be polite
+        time.sleep(0.12)
 
-    prev_cards = (prev.get("cards") or {}) if isinstance(prev, dict) else {}
     curr_cards = current["cards"]
 
     def get_prev_eur(k: str) -> float | None:
-        try:
-            v = prev_cards.get(k, {}).get("eur")
-            return float(v) if v is not None else None
-        except Exception:
-            return None
+        return safe_float(prev_cards.get(k, {}).get("eur"))
 
     for k, info in curr_cards.items():
-        eur = info.get("eur")
+        eur = safe_float(info.get("eur"))
         if eur is None or eur < args.min_price:
             continue
 
@@ -217,44 +380,104 @@ def main() -> None:
         delta = eur - prev_eur
         pct = (delta / prev_eur) * 100.0
 
-        # Spike
+        gbp = (eur * rate) if (rate is not None) else None
+        prev_gbp = (prev_eur * rate) if (rate is not None) else None
+
+        links = "\n".join([u for u in [info.get("scryfall_uri"), info.get("cardmarket_url")] if u])
+
         if (pct >= args.spike_pct) or (delta >= args.spike_abs):
+            y_line = f"Yesterday: €{prev_eur:.2f}" + (f" / £{prev_gbp:.2f}" if prev_gbp is not None else "")
+            t_line = f"Today: €{eur:.2f}" + (f" / £{gbp:.2f}" if gbp is not None else "")
             alerts.append(
                 f"📈 **PRICE SPIKE**\n"
                 f"**{info['name']}** ({info['set'].upper()} #{info['collector_number']} · {info['foil_kind']} · x{info['qty']})\n"
-                f"Yesterday: €{prev_eur:.2f}\n"
-                f"Today: €{eur:.2f} (**{pct:+.0f}%**, {delta:+.2f})\n"
-                f"{info.get('scryfall_uri','')}"
+                f"{y_line}\n"
+                f"{t_line} (**{pct:+.0f}%**, {delta:+.2f} EUR)\n"
+                f"{links}"
             )
 
-        # Dip
         if pct <= args.dip_pct:
+            y_line = f"Yesterday: €{prev_eur:.2f}" + (f" / £{prev_gbp:.2f}" if prev_gbp is not None else "")
+            t_line = f"Today: €{eur:.2f}" + (f" / £{gbp:.2f}" if gbp is not None else "")
             alerts.append(
                 f"📉 **PRICE DIP**\n"
                 f"**{info['name']}** ({info['set'].upper()} #{info['collector_number']} · {info['foil_kind']} · x{info['qty']})\n"
-                f"Yesterday: €{prev_eur:.2f}\n"
-                f"Today: €{eur:.2f} (**{pct:+.0f}%**, {delta:+.2f})\n"
-                f"{info.get('scryfall_uri','')}"
+                f"{y_line}\n"
+                f"{t_line} (**{pct:+.0f}%**, {delta:+.2f} EUR)\n"
+                f"{links}"
             )
 
-    # Post alerts
-    if webhook and alerts:
-        header = f"🧾 MTG price watch — {datetime.now(timezone.utc).strftime('%Y-%m-%d')} (EUR via Scryfall)\nAlerts: {len(alerts)}"
-        discord_post(webhook, header)
-        # Discord message limit: keep chunks reasonable
-        msg = ""
-        for a in alerts:
-            if len(msg) + len(a) + 2 > 1800:
-                discord_post(webhook, msg)
-                msg = a
-            else:
-                msg = (msg + "\n\n" + a).strip()
-        if msg:
-            discord_post(webhook, msg)
-    elif webhook and not alerts:
-        discord_post(webhook, f"🧾 MTG price watch — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\nNo alerts today.")
+    # Weekly full summary CSV + digest (default Sunday 19:00 UK time)
+    weekly_written = False
+    weekly_path = None
+    weekly_digest = None
 
-    # Save snapshot for tomorrow
+    if is_weekly_time(args.tz, args.weekly_day, args.weekly_time):
+        tz = ZoneInfo(args.tz)
+        now_local = datetime.now(tz)
+        stamp = now_local.strftime("%Y-%m-%d")
+        weekly_path = f"data/weekly/weekly_summary_{stamp}.csv"
+        write_weekly_summary_csv(
+            out_path=weekly_path,
+            cards=curr_cards,
+            rate_gbp_per_eur=rate,
+            prev_cards=prev_cards,
+        )
+        weekly_written = True
+        weekly_digest = build_weekly_digest(
+            curr_cards=curr_cards,
+            prev_cards=prev_cards,
+            rate_gbp_per_eur=rate,
+            min_price=args.min_price,
+            top_n=10,
+        )
+
+    # Post to Discord
+    if webhook:
+        tz = ZoneInfo(args.tz)
+        now_local = datetime.now(tz)
+        if rate is not None:
+            header = (
+                f"🧾 MTG price watch — {now_local.strftime('%Y-%m-%d %H:%M')} ({args.tz})\n"
+                f"FX: 1 EUR = {rate:.4f} GBP"
+            )
+        else:
+            header = (
+                f"🧾 MTG price watch — {now_local.strftime('%Y-%m-%d %H:%M')} ({args.tz})\n"
+                f"FX: unavailable"
+            )
+
+        if alerts:
+            discord_post(webhook, header + f"\nAlerts: {len(alerts)}")
+            msg = ""
+            for a in alerts:
+                if len(msg) + len(a) + 2 > 1800:
+                    discord_post(webhook, msg)
+                    msg = a
+                else:
+                    msg = (msg + "\n\n" + a).strip()
+            if msg:
+                discord_post(webhook, msg)
+        else:
+            discord_post(webhook, header + "\nNo alerts today.")
+
+        if weekly_written and weekly_path:
+            discord_post(webhook, f"📊 Weekly summary written: `{weekly_path}` (committed by workflow).")
+            if weekly_digest:
+                if len(weekly_digest) <= 1800:
+                    discord_post(webhook, weekly_digest)
+                else:
+                    chunk_msg = ""
+                    for line in weekly_digest.splitlines():
+                        if len(chunk_msg) + len(line) + 1 > 1800:
+                            discord_post(webhook, chunk_msg)
+                            chunk_msg = line
+                        else:
+                            chunk_msg = (chunk_msg + "\n" + line).strip()
+                    if chunk_msg:
+                        discord_post(webhook, chunk_msg)
+
+    # Save snapshot for next run
     save_snapshot(args.snapshot, current)
 
 

@@ -3,7 +3,7 @@ name: MTG Price Alerts
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "25 8 * * *"  # daily 08:25 UTC (08:25 UK in winter; 09:25 in summer)
+    - cron: "0 * * * *"  # hourly; script only runs at 07:00 and 19:00 Europe/London
 
 permissions:
   contents: write
@@ -26,12 +26,12 @@ jobs:
       - name: Run tracker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python tracker.py --csv collection/moxfield.csv
+        run: python tracker.py --csv collection/moxfield.csv --tz Europe/London --run-times 07:00,19:00
 
-      - name: Commit updated price snapshot
+      - name: Commit updated snapshots and summaries
         run: |
           git config user.name "mtg-alert-bot"
           git config user.email "mtg-alert-bot@users.noreply.github.com"
-          git add data/last_prices.json
-          git commit -m "Update price snapshot" || echo "No changes"
+          git add data/
+          git commit -m "Update MTG price data" || echo "No changes"
           git push
