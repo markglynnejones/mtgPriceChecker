@@ -539,7 +539,7 @@ def main() -> None:
                     print("Suppressing 'No alerts today' once (post-baseline).")
                     current["_meta"]["suppress_next_no_alerts"] = False
                 else:
-                discord_post(webhook, header + "\nNo alerts today.")
+                    discord_post(webhook, header + "\nNo alerts today.")
 
         if weekly_written and weekly_path:
             discord_post(webhook, f"📊 Weekly summary written: `{weekly_path}` (committed by workflow).")
