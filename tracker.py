@@ -72,8 +72,14 @@ def chunk(items: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
 def load_snapshot(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return {}
+            return json.loads(content)
+    except Exception:
+        return {}
 
 
 def save_snapshot(path: str, data: Dict[str, Any]) -> None:
