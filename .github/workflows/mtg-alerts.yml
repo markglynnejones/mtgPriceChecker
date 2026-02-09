@@ -29,12 +29,7 @@ jobs:
       - name: Run tracker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            python tracker.py --csv collection/moxfield.csv --tz Europe/London --run-times 07:00,19:00 --baseline-on-csv-change
-          else
-            python tracker.py --csv collection/moxfield.csv --tz Europe/London --run-times 07:00,19:00 --baseline-on-csv-change
-          fi
+        run: python tracker.py --csv collection/moxfield.csv --tz Europe/London --run-times 07:00,19:00 --baseline-on-csv-change
 
       - name: Commit updated snapshots and summaries
         run: |
