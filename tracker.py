@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 
 
 SCRYFALL_COLLECTION_URL = "https://api.scryfall.com/cards/collection"
+HISTORY_PATH = "data/history.json"
 
 
 LANG_MAP = {
@@ -37,7 +38,6 @@ def normalise_lang(s: str) -> str:
 
 
 def foil_kind(v: Any) -> str:
-    # Moxfield export examples: NaN / "foil" / "etched"
     if not isinstance(v, str) or not v.strip():
         return "nonfoil"
     v = v.strip().lower()
@@ -49,7 +49,6 @@ def foil_kind(v: Any) -> str:
 
 
 def pick_price_eur(prices: Dict[str, Any], kind: str) -> float | None:
-    # Scryfall: eur, eur_foil, eur_etched (strings or null)
     key = {"nonfoil": "eur", "foil": "eur_foil", "etched": "eur_etched"}.get(kind, "eur")
     val = prices.get(key)
     if val is None:
@@ -71,6 +70,23 @@ def chunk(items: List[Dict[str, Any]], n: int) -> List[List[Dict[str, Any]]]:
     return [items[i:i + n] for i in range(0, len(items), n)]
 
 
+def safe_float(v: Any) -> float | None:
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for ch in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(ch)
+    return h.hexdigest()
+
+
 def load_snapshot(path: str) -> Dict[str, Any]:
     if not os.path.exists(path):
         return {}
@@ -90,10 +106,65 @@ def save_snapshot(path: str, data: Dict[str, Any]) -> None:
         json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
 
 
+# -------- Trend history store --------
+
+def load_history(path: str) -> Dict[str, List[Dict[str, Any]]]:
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+            if not content:
+                return {}
+            data = json.loads(content)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_history(path: str, data: Dict[str, List[Dict[str, Any]]]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def update_history(
+    history: Dict[str, List[Dict[str, Any]]],
+    curr_cards: Dict[str, Any],
+    rate_gbp_per_eur: float | None,
+    ts: str,
+    window: int,
+) -> Dict[str, List[Dict[str, Any]]]:
+    for k, info in curr_cards.items():
+        eur = safe_float(info.get("eur"))
+        if eur is None:
+            continue
+        gbp = (eur * rate_gbp_per_eur) if rate_gbp_per_eur is not None else None
+        entries = history.get(k)
+        if not isinstance(entries, list):
+            entries = []
+        entries.append({"ts": ts, "eur": eur, "gbp": gbp})
+        if len(entries) > window:
+            entries = entries[-window:]
+        history[k] = entries
+    return history
+
+
+def moving_average(entries: List[Dict[str, Any]]) -> Tuple[float | None, float | None]:
+    if not entries:
+        return None, None
+    eurs = [safe_float(e.get("eur")) for e in entries]
+    eurs = [e for e in eurs if e is not None]
+    gbps = [safe_float(e.get("gbp")) for e in entries]
+    gbps = [g for g in gbps if g is not None]
+    avg_eur = (sum(eurs) / len(eurs)) if eurs else None
+    avg_gbp = (sum(gbps) / len(gbps)) if gbps else None
+    return avg_eur, avg_gbp
+
+
+# -------- FX / scheduling --------
+
 def eur_to_gbp_rate() -> float | None:
-    """
-    ECB daily FX rates: returns GBP per 1 EUR.
-    """
     url = "https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
@@ -105,9 +176,6 @@ def eur_to_gbp_rate() -> float | None:
 
 
 def should_run_now(tz_name: str, run_times_csv: str) -> bool:
-    """
-    Only run at those exact local times (e.g. 07:00,19:00)
-    """
     if not run_times_csv.strip():
         return True
     tz = ZoneInfo(tz_name)
@@ -131,27 +199,10 @@ def is_weekly_time(tz_name: str, weekly_day: str, weekly_time: str) -> bool:
     return now_local.weekday() == wd_target and now_local.strftime("%H:%M") == hm_target
 
 
-def safe_float(v: Any) -> float | None:
-    try:
-        if v is None:
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
-def file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for ch in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(ch)
-    return h.hexdigest()
-
+# -------- Collection parsing / misc --------
 
 def parse_csv_list(csv_arg: str) -> List[str]:
-    # Allow: --csv collection/moxfield.csv OR --csv a.csv,b.csv
-    parts = [p.strip() for p in csv_arg.split(",") if p.strip()]
-    return parts
+    return [p.strip() for p in csv_arg.split(",") if p.strip()]
 
 
 def read_collection_csvs(csv_paths: List[str]) -> pd.DataFrame:
@@ -168,13 +219,6 @@ def read_collection_csvs(csv_paths: List[str]) -> pd.DataFrame:
 
 
 def reprint_risk(info: Dict[str, Any]) -> str:
-    """
-    Heuristic risk tagging:
-    - Reserved list => Very Low
-    - Old (pre-2003) => Low
-    - Modern era => Medium
-    - Recently reprinted heuristic is hard without more data; keep it simple.
-    """
     if info.get("reserved_list") is True:
         return "Very Low (RL)"
     year = info.get("released_year")
@@ -242,134 +286,41 @@ def write_weekly_summary_csv(
     df.to_csv(out_path, index=False, encoding="utf-8")
 
 
-def build_weekly_digest(
-    curr_cards: Dict[str, Any],
-    prev_cards: Dict[str, Any],
-    rate_gbp_per_eur: float | None,
-    min_price: float,
-    top_n: int = 10,
-) -> str:
-    movers = []
-    for k, info in curr_cards.items():
-        eur = safe_float(info.get("eur"))
-        if eur is None or eur < min_price:
-            continue
-
-        prev_eur = safe_float(prev_cards.get(k, {}).get("eur"))
-        if prev_eur is None or prev_eur <= 0:
-            continue
-
-        delta_eur = eur - prev_eur
-        pct = (delta_eur / prev_eur) * 100.0
-
-        gbp = (eur * rate_gbp_per_eur) if (rate_gbp_per_eur is not None) else None
-        prev_gbp = (prev_eur * rate_gbp_per_eur) if (rate_gbp_per_eur is not None) else None
-        delta_gbp = (gbp - prev_gbp) if (gbp is not None and prev_gbp is not None) else None
-
-        movers.append((pct, delta_eur, delta_gbp, info))
-
-    if not movers:
-        return "📊 **Weekly digest (your collection)**\nNo movers with enough price history to report yet."
-
-    gainers = sorted(movers, key=lambda x: x[0], reverse=True)[:top_n]
-    losers = sorted(movers, key=lambda x: x[0])[:top_n]
-
-    def fmt_line(pct, delta_eur, delta_gbp, info):
-        name = info["name"]
-        tag = f"{info['set'].upper()} #{info['collector_number']} · {info['foil_kind']} · x{info['qty']}"
-        links = " | ".join([u for u in [info.get("scryfall_uri"), info.get("cardmarket_url")] if u])
-        gbp_part = f"£{delta_gbp:+.2f}" if delta_gbp is not None else "n/a"
-        return f"- **{name}** ({tag}) — **{pct:+.0f}%** (Δ {gbp_part}, Δ€{delta_eur:+.2f}) · Risk: {info.get('risk','?')}\n  {links}"
-
-    lines = ["📊 **Weekly digest (your collection)**", "", "**Top gainers**"]
-    for pct, d_eur, d_gbp, info in gainers:
-        lines.append(fmt_line(pct, d_eur, d_gbp, info))
-
-    lines += ["", "**Top losers**"]
-    for pct, d_eur, d_gbp, info in losers:
-        lines.append(fmt_line(pct, d_eur, d_gbp, info))
-
-    return "\n".join(lines)
-
-
-def build_weekly_what_to_list(
-    curr_cards: Dict[str, Any],
-    prev_cards: Dict[str, Any],
-    rate_gbp_per_eur: float | None,
-    min_price: float,
-    min_pct: float,
-    min_abs_gbp: float,
-    top_n: int = 10,
-) -> str:
-    """
-    Weekly seller-focused summary:
-    - "worth listing" if up >= min_pct OR up >= min_abs_gbp in GBP terms
-    """
-    candidates = []
-    for k, info in curr_cards.items():
-        eur = safe_float(info.get("eur"))
-        if eur is None or eur < min_price:
-            continue
-
-        prev_eur = safe_float(prev_cards.get(k, {}).get("eur"))
-        if prev_eur is None or prev_eur <= 0:
-            continue
-
-        delta_eur = eur - prev_eur
-        pct = (delta_eur / prev_eur) * 100.0
-
-        gbp = (eur * rate_gbp_per_eur) if (rate_gbp_per_eur is not None) else None
-        prev_gbp = (prev_eur * rate_gbp_per_eur) if (rate_gbp_per_eur is not None) else None
-        delta_gbp = (gbp - prev_gbp) if (gbp is not None and prev_gbp is not None) else None
-
-        is_candidate = (pct >= min_pct) or (delta_gbp is not None and delta_gbp >= min_abs_gbp)
-        if not is_candidate:
-            continue
-
-        score = pct  # simple sort score
-        candidates.append((score, pct, delta_gbp, info, gbp, eur))
-
-    if not candidates:
-        return "🧾 **Weekly: what to list**\nNo clear “list now” candidates this week."
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-    candidates = candidates[:top_n]
-
-    lines = ["🧾 **Weekly: what to list (your collection)**"]
-    for _, pct, d_gbp, info, gbp, eur in candidates:
-        tag = f"{info['set'].upper()} #{info['collector_number']} · {info['foil_kind']} · x{info['qty']}"
-        links = " | ".join([u for u in [info.get("scryfall_uri"), info.get("cardmarket_url")] if u])
-        d_gbp_txt = f"{d_gbp:+.2f}" if d_gbp is not None else "n/a"
-        lines.append(
-            f"- **{info['name']}** ({tag}) — now {fmt_money_gbp_first(eur, gbp)} "
-            f"(~Δ£{d_gbp_txt}, {pct:+.0f}%) · Risk: {info.get('risk','?')}\n  {links}"
-        )
-
-    return "\n".join(lines)
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Path(s) to Moxfield export CSV. Single file or comma-separated list.")
     ap.add_argument("--snapshot", default="data/last_prices.json", help="Where to store last run prices")
+
     ap.add_argument("--spike_pct", type=float, default=30.0, help="Spike threshold percent (day-over-day)")
     ap.add_argument("--spike_abs_eur", type=float, default=2.0, help="Spike threshold absolute EUR increase")
     ap.add_argument("--dip_pct", type=float, default=-25.0, help="Dip threshold percent (negative)")
     ap.add_argument("--min_price_eur", type=float, default=1.5, help="Ignore cards below this EUR price")
+
     ap.add_argument("--tz", default="Europe/London", help="Timezone for run gating, e.g. Europe/London")
     ap.add_argument("--run-times", default="07:00,19:00", help="Comma-separated local times to run, e.g. 07:00,19:00")
+
     ap.add_argument("--weekly-day", default="SUN", help="Weekly summary day (MON..SUN), default SUN")
     ap.add_argument("--weekly-time", default="19:00", help="Weekly summary local time, default 19:00")
-    ap.add_argument("--baseline-on-csv-change", action="store_true", help="If CSV changed, run baseline snapshot update and skip alerts")
+
+    ap.add_argument("--baseline-on-csv-change", action="store_true",
+                    help="If CSV changed, run baseline snapshot update and skip alerts")
+
     # Sell / buy signals
     ap.add_argument("--sell_candidate_pct", type=float, default=80.0, help="Sell-candidate threshold percent gain")
     ap.add_argument("--sell_candidate_abs_gbp", type=float, default=5.0, help="Sell-candidate threshold absolute GBP gain")
     ap.add_argument("--buy_more_pct", type=float, default=-30.0, help="Buy-more signal threshold percent drop (negative)")
+
     # Weekly list-now report thresholds
     ap.add_argument("--weekly_list_pct", type=float, default=50.0, help="Weekly list-now pct threshold")
     ap.add_argument("--weekly_list_abs_gbp", type=float, default=4.0, help="Weekly list-now abs GBP threshold")
-    args = ap.parse_args()
 
+    # Trend smoothing
+    ap.add_argument("--trend_window", type=int, default=14, help="Trend window (entries) for moving average")
+    ap.add_argument("--trend_spike_pct", type=float, default=20.0, help="Trend spike threshold percent over average")
+    ap.add_argument("--trend_dip_pct", type=float, default=-15.0, help="Trend dip threshold percent under average")
+    ap.add_argument("--trend_min_points", type=int, default=6, help="Minimum data points required for trend alerts")
+
+    args = ap.parse_args()
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
     csv_paths = parse_csv_list(args.csv)
@@ -401,7 +352,6 @@ def main() -> None:
             return
 
     # FX rate (GBP per EUR)
-    rate = None
     try:
         rate = eur_to_gbp_rate()
     except Exception:
@@ -444,8 +394,7 @@ def main() -> None:
             "qty": int(row["total_qty"]),
         }
 
-    now_utc = datetime.now(timezone.utc)
-    now_iso = now_utc.isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     current: Dict[str, Any] = {
         "_meta": {
@@ -517,6 +466,13 @@ def main() -> None:
 
     curr_cards = current["cards"]
 
+    # ---- Update trend history (always, even for baseline runs) ----
+    history = load_history(HISTORY_PATH)
+    history = update_history(history, curr_cards, rate, now_iso, args.trend_window)
+    # Prune history for cards no longer in collection (prevents bloat)
+    history = {k: v for k, v in history.items() if k in curr_cards}
+    save_history(HISTORY_PATH, history)
+
     # --- BASELINE RUN SHORT-CIRCUIT ---
     baseline_run = bool(args.baseline_on_csv_change and csv_changed)
     if baseline_run:
@@ -541,6 +497,7 @@ def main() -> None:
     alerts: List[str] = []
     sell_candidates: List[str] = []
     buy_more_signals: List[str] = []
+    trend_alerts: List[str] = []
 
     for k, info in curr_cards.items():
         eur = safe_float(info.get("eur"))
@@ -563,7 +520,7 @@ def main() -> None:
         money_now = fmt_money_gbp_first(eur, gbp)
         money_prev = fmt_money_gbp_first(prev_eur, prev_gbp)
 
-        # Base spike/dip alerts (your original behaviour)
+        # Base spike/dip alerts
         if (pct >= args.spike_pct) or (delta_eur >= args.spike_abs_eur):
             alerts.append(
                 f"📈 **PRICE SPIKE**\n"
@@ -584,7 +541,7 @@ def main() -> None:
                 f"{links}"
             )
 
-        # Sell candidate (strong move)
+        # Sell candidate
         is_sell = (pct >= args.sell_candidate_pct) or (delta_gbp is not None and delta_gbp >= args.sell_candidate_abs_gbp)
         if is_sell:
             dgbp = f"{delta_gbp:+.2f}" if delta_gbp is not None else "n/a"
@@ -596,7 +553,7 @@ def main() -> None:
                 f"{links}"
             )
 
-        # Buy-more signal (big dip)
+        # Buy-more signal
         if pct <= args.buy_more_pct:
             dgbp = f"{delta_gbp:+.2f}" if delta_gbp is not None else "n/a"
             buy_more_signals.append(
@@ -607,16 +564,41 @@ def main() -> None:
                 f"{links}"
             )
 
-    # Weekly full summary CSV + digests
-    weekly_written = False
-    weekly_path = None
-    weekly_digest = None
-    weekly_list_report = None
+        # Trend spike/dip vs moving average
+        hist = history.get(k, [])
+        if len(hist) >= args.trend_min_points:
+            avg_eur, avg_gbp = moving_average(hist)
+            if avg_eur is not None and avg_eur > 0:
+                pct_vs_avg = ((eur - avg_eur) / avg_eur) * 100.0
+                avg_money = fmt_money_gbp_first(avg_eur, avg_gbp)
 
+                spike_mult = 1.0 + (args.trend_spike_pct / 100.0)
+                dip_mult = 1.0 + (args.trend_dip_pct / 100.0)  # dip pct is negative by default
+
+                if eur >= avg_eur * spike_mult:
+                    trend_alerts.append(
+                        f"📊 **TREND SPIKE**\n"
+                        f"**{info['name']}** ({tag})\n"
+                        f"Now: {money_now}\n"
+                        f"Avg ({len(hist)} pts): {avg_money} (**{pct_vs_avg:+.0f}%**)\n"
+                        f"Risk: {info.get('risk','?')}\n"
+                        f"{links}"
+                    )
+
+                if eur <= avg_eur * dip_mult:
+                    trend_alerts.append(
+                        f"📉 **TREND DIP**\n"
+                        f"**{info['name']}** ({tag})\n"
+                        f"Now: {money_now}\n"
+                        f"Avg ({len(hist)} pts): {avg_money} (**{pct_vs_avg:+.0f}%**)\n"
+                        f"Risk: {info.get('risk','?')}\n"
+                        f"{links}"
+                    )
+
+    # Weekly CSV
     if is_weekly_time(args.tz, args.weekly_day, args.weekly_time):
         tz = ZoneInfo(args.tz)
-        now_local = datetime.now(tz)
-        stamp = now_local.strftime("%Y-%m-%d")
+        stamp = datetime.now(tz).strftime("%Y-%m-%d")
         weekly_path = f"data/weekly/weekly_summary_{stamp}.csv"
         write_weekly_summary_csv(
             out_path=weekly_path,
@@ -624,33 +606,14 @@ def main() -> None:
             rate_gbp_per_eur=rate,
             prev_cards=prev_cards,
         )
-        weekly_written = True
-        weekly_digest = build_weekly_digest(
-            curr_cards=curr_cards,
-            prev_cards=prev_cards,
-            rate_gbp_per_eur=rate,
-            min_price=args.min_price_eur,
-            top_n=10,
-        )
-        weekly_list_report = build_weekly_what_to_list(
-            curr_cards=curr_cards,
-            prev_cards=prev_cards,
-            rate_gbp_per_eur=rate,
-            min_price=args.min_price_eur,
-            min_pct=args.weekly_list_pct,
-            min_abs_gbp=args.weekly_list_abs_gbp,
-            top_n=10,
-        )
 
     # Discord posting
     if webhook:
         tz = ZoneInfo(args.tz)
         now_local = datetime.now(tz)
-
         fx_line = f"FX: 1 EUR = {rate:.4f} GBP" if rate is not None else "FX: unavailable"
         header = f"🧾 MTG price watch — {now_local.strftime('%Y-%m-%d %H:%M')} ({args.tz})\n{fx_line}"
 
-        # Sell candidates first (actionable)
         if sell_candidates:
             discord_post(webhook, header + f"\nSell candidates: {len(sell_candidates)}")
             msg = ""
@@ -663,7 +626,6 @@ def main() -> None:
             if msg:
                 discord_post(webhook, msg)
 
-        # Buy-more signals
         if buy_more_signals:
             discord_post(webhook, header + f"\nBuy-more signals: {len(buy_more_signals)}")
             msg = ""
@@ -676,7 +638,18 @@ def main() -> None:
             if msg:
                 discord_post(webhook, msg)
 
-        # Regular spike/dip alerts
+        if trend_alerts:
+            discord_post(webhook, header + f"\nTrend alerts: {len(trend_alerts)}")
+            msg = ""
+            for a in trend_alerts:
+                if len(msg) + len(a) + 2 > 1800:
+                    discord_post(webhook, msg)
+                    msg = a
+                else:
+                    msg = (msg + "\n\n" + a).strip()
+            if msg:
+                discord_post(webhook, msg)
+
         if alerts:
             discord_post(webhook, header + f"\nAlerts: {len(alerts)}")
             msg = ""
@@ -689,44 +662,16 @@ def main() -> None:
             if msg:
                 discord_post(webhook, msg)
         else:
-            # Suppress "No alerts today" exactly once after a baseline, then clear the flag.
-            if prev_suppress_next_no_alerts:
-                print("Suppressing 'No alerts today' once (post-baseline).")
-                current["_meta"]["suppress_next_no_alerts"] = False
+            any_alerts = bool(sell_candidates or buy_more_signals or trend_alerts)
+            if not any_alerts:
+                if prev_suppress_next_no_alerts:
+                    print("Suppressing 'No alerts today' once (post-baseline).")
+                    current["_meta"]["suppress_next_no_alerts"] = False
+                else:
+                    discord_post(webhook, header + "\nNo alerts today.")
             else:
-                discord_post(webhook, header + "\nNo alerts today.")
-
-        # Weekly extras
-        if weekly_written and weekly_path:
-            discord_post(webhook, f"📊 Weekly summary written: `{weekly_path}` (committed by workflow).")
-
-            if weekly_digest:
-                if len(weekly_digest) <= 1800:
-                    discord_post(webhook, weekly_digest)
-                else:
-                    chunk_msg = ""
-                    for line in weekly_digest.splitlines():
-                        if len(chunk_msg) + len(line) + 1 > 1800:
-                            discord_post(webhook, chunk_msg)
-                            chunk_msg = line
-                        else:
-                            chunk_msg = (chunk_msg + "\n" + line).strip()
-                    if chunk_msg:
-                        discord_post(webhook, chunk_msg)
-
-            if weekly_list_report:
-                if len(weekly_list_report) <= 1800:
-                    discord_post(webhook, weekly_list_report)
-                else:
-                    chunk_msg = ""
-                    for line in weekly_list_report.splitlines():
-                        if len(chunk_msg) + len(line) + 1 > 1800:
-                            discord_post(webhook, chunk_msg)
-                            chunk_msg = line
-                        else:
-                            chunk_msg = (chunk_msg + "\n" + line).strip()
-                    if chunk_msg:
-                        discord_post(webhook, chunk_msg)
+                if prev_suppress_next_no_alerts:
+                    current["_meta"]["suppress_next_no_alerts"] = False
 
     # Save snapshot for next run
     save_snapshot(args.snapshot, current)
