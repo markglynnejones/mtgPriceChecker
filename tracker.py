@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Tuple
 
 import pandas as pd
 import requests
+import hashlib
 from zoneinfo import ZoneInfo
 
 
@@ -34,6 +35,13 @@ def normalise_lang(s: str) -> str:
         return "en"
     return LANG_MAP.get(s.strip(), "en")
 
+
+def file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 def foil_kind(v: Any) -> str:
     # Moxfield export examples: NaN / "foil" / "etched"
@@ -253,12 +261,36 @@ def main() -> None:
     ap.add_argument("--run-times", default="07:00,19:00", help="Comma-separated local times to run, e.g. 07:00,19:00")
     ap.add_argument("--weekly-day", default="SUN", help="Weekly summary day (MON..SUN), default SUN")
     ap.add_argument("--weekly-time", default="19:00", help="Weekly summary local time, default 19:00")
+    ap.add_argument("--baseline-on-csv-change", action="store_true", help="If CSV changed, run a baseline snapshot update and skip alerts")
     args = ap.parse_args()
+
+    prev = load_snapshot(args.snapshot)
+    prev_cards = (prev.get("cards") or {}) if isinstance(prev, dict) else {}
+
+    prev_was_baseline = False
+    try:
+        prev_was_baseline = (prev.get("_meta", {}).get("run_type") == "baseline")
+    except Exception:
+        prev_was_baseline = False
+
+
+    csv_hash = file_sha256(args.csv)
+    prev_hash = None
+    try:
+        prev_hash = prev.get("_meta", {}).get("csv_sha256")
+    except Exception:
+        prev_hash = None
+
+    csv_changed = (prev_hash != csv_hash)
 
     # Gate to run times (so you can schedule the workflow hourly).
     if not should_run_now(args.tz, args.run_times):
-        print("Not a scheduled run time; exiting.")
-        return
+        if args.baseline_on_csv_change and csv_changed:
+            # allow baseline runs outside schedule
+            pass
+        else:
+            print("Not a scheduled run time; exiting.")
+            return
 
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -317,7 +349,16 @@ def main() -> None:
     now_utc = datetime.now(timezone.utc)
     now_iso = now_utc.isoformat()
 
-    current: Dict[str, Any] = {"_meta": {"generated_at": now_iso, "eur_to_gbp": rate}, "cards": {}}
+    current: Dict[str, Any] = {
+        "_meta": {
+            "generated_at": now_iso,
+            "eur_to_gbp": rate,
+            "csv_sha256": csv_hash,
+            "run_type": "scheduled",  # will be overwritten to "baseline" when needed
+        },
+        "cards": {}
+    }
+
     alerts: List[str] = []
 
     # Query Scryfall in batches of up to 75 identifiers
@@ -364,6 +405,26 @@ def main() -> None:
         time.sleep(0.12)
 
     curr_cards = current["cards"]
+
+    # --- BASELINE RUN SHORT-CIRCUIT ---
+    baseline_run = bool(args.baseline_on_csv_change and csv_changed)
+
+    if baseline_run:
+        current["_meta"]["run_type"] = "baseline"
+        save_snapshot(args.snapshot, current)
+
+        if webhook:
+            tz = ZoneInfo(args.tz)
+            now_local = datetime.now(tz)
+            discord_post(
+                webhook,
+                f"🧱 **Baseline updated** — collection CSV changed.\n"
+                f"Time: {now_local.strftime('%Y-%m-%d %H:%M')} ({args.tz})\n"
+                f"Alerts will resume on the next scheduled run (07:00 or 19:00)."
+            )
+
+        return
+
 
     def get_prev_eur(k: str) -> float | None:
         return safe_float(prev_cards.get(k, {}).get("eur"))
@@ -459,7 +520,12 @@ def main() -> None:
             if msg:
                 discord_post(webhook, msg)
         else:
-            discord_post(webhook, header + "\nNo alerts today.")
+            # If the previous run was a baseline, don't spam a pointless "No alerts today"
+            # on the very next scheduled run.
+            if prev_was_baseline:
+                print("Previous run was baseline; suppressing 'No alerts today' message.")
+            else:
+                discord_post(webhook, header + "\nNo alerts today.")
 
         if weekly_written and weekly_path:
             discord_post(webhook, f"📊 Weekly summary written: `{weekly_path}` (committed by workflow).")
