@@ -602,7 +602,12 @@ def main() -> None:
 
         # Export dashboard too (useful immediately after baseline refresh)
         if args.export_dashboard:
-            export_dashboard_from_history(history=history, curr_cards=curr_cards, out_dir=args.dashboard_out_dir)
+            prices_out, cards_out, card_count, series_count = export_dashboard_from_history(
+                history=history,
+                curr_cards=curr_cards,
+                out_dir=args.dashboard_out_dir,
+            )
+            print(f"[dashboard] wrote {prices_out} and {cards_out} ({card_count} cards, {series_count} series)")
 
         if webhook:
             tz = ZoneInfo(args.tz)

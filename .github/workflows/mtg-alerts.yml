@@ -35,6 +35,6 @@ jobs:
         run: |
           git config user.name "mtg-alert-bot"
           git config user.email "mtg-alert-bot@users.noreply.github.com"
-          git add data/
+          git add data/ docs/data
           git commit -m "Update MTG price data" || echo "No changes"
           git push
