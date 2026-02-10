@@ -347,12 +347,134 @@ function setSelectedBase(name) {
   applyViewState();
 }
 
-/** ---------- Movers placeholder (Step 3 will replace this) ---------- **/
-function renderMoversPlaceholder() {
+function pctChange(from, to) {
+  if (from === null || from === undefined || from === 0) return null;
+  return ((to - from) / from) * 100;
+}
+
+function seriesLast(series) {
+  if (!series || !series.length) return null;
+  const s = sortSeries(series);
+  return s[s.length - 1];
+}
+
+function seriesValueAtOrBefore(series, targetISODate) {
+  const s = sortSeries(series);
+  const p = getClosestOnOrBefore(s, targetISODate);
+  return p ? p.price : null;
+}
+
+function isoMinusDays(isoDate, days) {
+  // isoDate is YYYY-MM-DD
+  const d = parseDateISO(isoDate);
+  const t = new Date(d.getTime() - days * 24 * 60 * 60 * 1000);
+  const y = t.getUTCFullYear();
+  const m = String(t.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(t.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+}
+
+function computeMovers7d(limit = 8) {
+  const movers = [];
+  for (const baseName of baseNames) {
+    const combined = buildCombinedSeries(baseName);
+    const lastPt = seriesLast(combined);
+    if (!lastPt) continue;
+
+    const endDate = lastPt.date;
+    const startDate = isoMinusDays(endDate, 7);
+
+    const startVal = seriesValueAtOrBefore(combined, startDate);
+    const endVal = lastPt.price;
+
+    if (startVal === null || startVal === undefined) continue;
+
+    const delta = endVal - startVal;
+    const pct = pctChange(startVal, endVal);
+
+    movers.push({
+      baseName,
+      startDate,
+      endDate,
+      startVal,
+      endVal,
+      delta,
+      pct,
+    });
+  }
+
+  const gainers = movers
+    .filter(m => m.delta > 0)
+    .sort((a, b) => b.delta - a.delta)
+    .slice(0, limit);
+
+  const losers = movers
+    .filter(m => m.delta < 0)
+    .sort((a, b) => a.delta - b.delta) // most negative first
+    .slice(0, limit);
+
+  return { gainers, losers };
+}
+
+function renderMovers() {
+  const { gainers, losers } = computeMovers7d(8);
+
   els.movers.innerHTML = "";
-  const li = document.createElement("li");
-  li.textContent = "Next: this will become real top movers (7-day) computed from history.";
-  els.movers.appendChild(li);
+
+  const makeHeader = (text) => {
+    const h = document.createElement("div");
+    h.style.marginTop = "10px";
+    h.style.marginBottom = "6px";
+    h.style.fontWeight = "600";
+    h.textContent = text;
+    return h;
+  };
+
+  const makeRow = (m) => {
+    const li = document.createElement("li");
+    li.style.cursor = "pointer";
+    li.style.userSelect = "none";
+
+    const pctStr = (m.pct === null ? "—" : `${m.pct >= 0 ? "+" : ""}${m.pct.toFixed(1)}%`);
+    const deltaStr = `${m.delta >= 0 ? "+" : ""}${formatGBP(m.delta)}`;
+
+    li.textContent = `${m.baseName}: ${deltaStr} (${pctStr})`;
+
+    li.addEventListener("click", () => {
+      // jump to that card and keep current view mode
+      setSelectedBase(m.baseName);
+      // optional: scroll to chart
+      document.getElementById("priceChart")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    });
+
+    return li;
+  };
+
+  // If no data yet, show a friendly message
+  if (!gainers.length && !losers.length) {
+    const li = document.createElement("li");
+    li.textContent = "Not enough history yet to compute 7-day movers.";
+    els.movers.appendChild(li);
+    return;
+  }
+
+  els.movers.appendChild(makeHeader("📈 Top Gainers (7d)"));
+  if (gainers.length) {
+    gainers.forEach(m => els.movers.appendChild(makeRow(m)));
+  } else {
+    const li = document.createElement("li");
+    li.textContent = "No gainers in the last 7 days.";
+    els.movers.appendChild(li);
+  }
+
+  els.movers.appendChild(makeHeader("📉 Top Losers (7d)"));
+  if (losers.length) {
+    losers.forEach(m => els.movers.appendChild(makeRow(m)));
+  } else {
+    const li = document.createElement("li");
+    li.textContent = "No losers in the last 7 days.";
+    els.movers.appendChild(li);
+  }
 }
 
 async function loadJson(path) {
@@ -362,7 +484,7 @@ async function loadJson(path) {
 }
 
 async function init() {
-  renderMoversPlaceholder();
+  renderMovers();
 
   [cards, pricesById] = await Promise.all([
     loadJson("./data/cards.json"),
