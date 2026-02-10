@@ -1,3 +1,4 @@
+print("=== TRACKER.PY VERSION: DASHBOARD EXPORT BUILD ===")
 import argparse
 import hashlib
 import json
