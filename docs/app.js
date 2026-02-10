@@ -1,12 +1,16 @@
-/* Dashboard UI (improved display)
-   - Uses series key as an internal ID (unique per printing)
-   - Displays "card name" only in the dropdown/search
-   - Shows set / collector / lang / finish as badges
+/* Dashboard v2:
+   - Card dropdown shows base names only
+   - Printing selector shows printings for selected card
+   - View mode: Combined (default) or Specific printing
+   - Combined aggregation: MAX price per day across printings
 */
 
 const els = {
   cardSearch: document.getElementById("cardSearch"),
   cardSelect: document.getElementById("cardSelect"),
+  viewMode: document.getElementById("viewMode"),
+  printingSelect: document.getElementById("printingSelect"),
+
   cardTitle: document.getElementById("cardTitle"),
   cardBadges: document.getElementById("cardBadges"),
   statCurrent: document.getElementById("statCurrent"),
@@ -17,24 +21,30 @@ const els = {
   movers: document.getElementById("movers"),
 };
 
-let cards = [];
-let pricesById = {};
+let cards = [];        // from cards.json (each is a printing id label)
+let pricesById = {};   // from prices.json keyed by printing id label
 let chart = null;
 
-/** -------- helpers -------- **/
+// index
+let baseNames = [];                           // unique card names
+let printingsByBase = new Map();              // baseName -> array of printing objects
+let selectedBase = null;
+let selectedPrintingId = null;
+
+/** ---------- helpers ---------- **/
 
 function formatGBP(n) {
   if (n === null || n === undefined || Number.isNaN(n)) return "—";
   return new Intl.NumberFormat("en-GB", { style: "currency", currency: "GBP" }).format(n);
 }
 
+function sortSeries(series) {
+  return [...series].sort((a, b) => a.date.localeCompare(b.date));
+}
+
 function parseDateISO(s) {
   const [y, m, d] = s.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d));
-}
-
-function sortSeries(series) {
-  return [...series].sort((a, b) => a.date.localeCompare(b.date));
 }
 
 function getClosestOnOrBefore(series, targetDateISO) {
@@ -74,91 +84,88 @@ function computeStats(series) {
   return { current, change7d, change7dPct, ath: ath === -Infinity ? null : ath, count: sorted.length };
 }
 
-/** -------- NEW: parse label into a nice display model -------- **/
+/**
+ * Our exporter uses a label like:
+ *   "Aim High (INR #185 en nonfoil)"
+ * We parse that so the UI can group by base name and show printing details.
+ */
 function parseLabel(label) {
-  // Expected: "Name (SET #123 en nonfoil)"
-  // But we’ll be tolerant if format varies.
   const out = {
     id: label,
-    displayName: label,
+    baseName: label,
     set: null,
     collector: null,
     lang: null,
     finish: null,
+    printable: label,
   };
 
   const m = /^(.+?)\s*\((.+)\)\s*$/.exec(label);
   if (!m) return out;
 
-  out.displayName = m[1].trim();
+  out.baseName = m[1].trim();
   const inside = m[2].trim();
-
-  // Common inside tokens: "CMM #123 en nonfoil"
   const tokens = inside.split(/\s+/).filter(Boolean);
 
-  if (tokens.length > 0) out.set = tokens[0].toUpperCase();
+  if (tokens[0]) out.set = tokens[0].toUpperCase();
 
-  // find collector like "#123"
   const cn = tokens.find(t => t.startsWith("#"));
   if (cn) out.collector = cn.replace("#", "");
 
-  // language likely a 2-3 char code in tokens (en, ja, zhs, zht, etc.)
-  const lang = tokens.find(t => /^[a-z]{2,3}$/.test(t) || /^zh[st]$/.test(t) || /^zhs$/.test(t) || /^zht$/.test(t));
+  const lang = tokens.find(t => /^[a-z]{2,3}$/.test(t) || /^zhs$/.test(t) || /^zht$/.test(t));
   if (lang) out.lang = lang;
 
-  // finish likely one of: foil/nonfoil/etched
   const finish = tokens.find(t => ["foil", "nonfoil", "non-foil", "etched"].includes(t.toLowerCase()));
   if (finish) out.finish = finish.toLowerCase() === "non-foil" ? "nonfoil" : finish.toLowerCase();
 
+  const bits = [];
+  if (out.set) bits.push(out.set);
+  if (out.collector) bits.push(`#${out.collector}`);
+  if (out.lang) bits.push(out.lang);
+  if (out.finish) bits.push(out.finish);
+
+  out.printable = bits.join(" ");
   return out;
 }
 
-/** -------- NEW: group printings by base card name -------- **/
-function groupByName(cards) {
-  const map = new Map(); // displayName -> [cardObj]
-  for (const c of cards) {
-    const parsed = parseLabel(c.name);
-    const displayName = parsed.displayName;
-    const item = { ...c, _parsed: parsed };
-    if (!map.has(displayName)) map.set(displayName, []);
-    map.get(displayName).push(item);
+/** Combined series = max price per day across printings */
+function buildCombinedSeries(baseName) {
+  const printings = printingsByBase.get(baseName) || [];
+  const perDay = new Map(); // date -> maxPrice
+
+  for (const p of printings) {
+    const series = pricesById[p.id] || [];
+    for (const pt of series) {
+      const curr = perDay.get(pt.date);
+      if (curr === undefined || pt.price > curr) perDay.set(pt.date, pt.price);
+    }
   }
-  return map;
+
+  const dates = Array.from(perDay.keys()).sort();
+  return dates.map(d => ({ date: d, price: perDay.get(d) }));
 }
 
-function makeOptionText(item) {
-  // Dropdown shows only base name; if multiple printings exist, add a suffix.
-  const p = item._parsed || parseLabel(item.name);
-  const base = p.displayName;
+/** ---------- rendering ---------- **/
 
-  // If we have set/collector/finish, show a short disambiguator
-  const bits = [];
-  if (p.set) bits.push(p.set);
-  if (p.collector) bits.push(`#${p.collector}`);
-  if (p.lang) bits.push(p.lang);
-  if (p.finish) bits.push(p.finish);
-
-  return bits.length ? `${base} — ${bits.join(" ")}` : base;
-}
-
-/** -------- UI render -------- **/
-
-function renderBadges(card) {
+function renderBadgesForCombined(baseName) {
   els.cardBadges.innerHTML = "";
-  if (!card) return;
 
-  const p = card._parsed || parseLabel(card.name);
+  const printings = printingsByBase.get(baseName) || [];
+  const sets = new Set();
+  const langs = new Set();
+  const finishes = new Set();
+
+  for (const p of printings) {
+    if (p.set) sets.add(p.set);
+    if (p.lang) langs.add(p.lang);
+    if (p.finish) finishes.add(p.finish);
+  }
 
   const parts = [];
-  if (p.set) parts.push(`Set: ${p.set}`);
-  if (p.collector) parts.push(`No: ${p.collector}`);
-  if (p.lang) parts.push(`Lang: ${p.lang}`);
-  if (p.finish) parts.push(`Finish: ${p.finish}`);
-
-  // fallback to supplied metadata if label parsing didn’t find it
-  if (!p.set && card.set) parts.push(`Set: ${card.set}`);
-  if (!card.rarity && card.rarity) parts.push(`Rarity: ${card.rarity}`);
-  if (!p.finish && card.finish) parts.push(`Finish: ${card.finish}`);
+  parts.push(`Printings: ${printings.length}`);
+  if (sets.size) parts.push(`Sets: ${sets.size}`);
+  if (langs.size) parts.push(`Langs: ${langs.size}`);
+  if (finishes.size) parts.push(`Finishes: ${Array.from(finishes).join(", ")}`);
 
   for (const txt of parts) {
     const span = document.createElement("span");
@@ -168,7 +175,24 @@ function renderBadges(card) {
   }
 }
 
-function renderChart(cardLabelId, series) {
+function renderBadgesForPrinting(printing) {
+  els.cardBadges.innerHTML = "";
+  const parts = [];
+
+  if (printing.set) parts.push(`Set: ${printing.set}`);
+  if (printing.collector) parts.push(`No: ${printing.collector}`);
+  if (printing.lang) parts.push(`Lang: ${printing.lang}`);
+  if (printing.finish) parts.push(`Finish: ${printing.finish}`);
+
+  for (const txt of parts) {
+    const span = document.createElement("span");
+    span.className = "badge";
+    span.textContent = txt;
+    els.cardBadges.appendChild(span);
+  }
+}
+
+function renderChart(label, series) {
   const sorted = sortSeries(series || []);
   const labels = sorted.map(p => p.date);
   const data = sorted.map(p => p.price);
@@ -177,7 +201,7 @@ function renderChart(cardLabelId, series) {
   if (chart) {
     chart.data.labels = labels;
     chart.data.datasets[0].data = data;
-    chart.data.datasets[0].label = `${cardLabelId} (GBP)`;
+    chart.data.datasets[0].label = label;
     chart.update();
     return;
   }
@@ -188,7 +212,7 @@ function renderChart(cardLabelId, series) {
       labels,
       datasets: [
         {
-          label: `${cardLabelId} (GBP)`,
+          label,
           data,
           tension: 0.25,
           pointRadius: 2,
@@ -200,11 +224,19 @@ function renderChart(cardLabelId, series) {
       responsive: true,
       maintainAspectRatio: true,
       plugins: {
-        legend: { display: false }, // cleaner
-        tooltip: { callbacks: { label: (ctx) => ` ${formatGBP(ctx.parsed.y)}` } },
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => ` ${formatGBP(ctx.parsed.y)}`,
+          },
+        },
       },
       scales: {
-        y: { ticks: { callback: (v) => formatGBP(v) } },
+        y: {
+          ticks: {
+            callback: (v) => formatGBP(v),
+          },
+        },
       },
     },
   });
@@ -233,62 +265,94 @@ function renderStats(series) {
   }
 }
 
-function setSelectedCardById(cardId) {
-  const card = cards.find(c => c.name === cardId) || { name: cardId };
-  const p = card._parsed || parseLabel(cardId);
-
-  const series = pricesById[cardId] || [];
-  const bits = [];
-  if (p.set) bits.push(p.set);
-  if (p.collector) bits.push(`#${p.collector}`);
-  if (p.lang) bits.push(p.lang);
-  if (p.finish) bits.push(p.finish);
-
-  els.cardTitle.textContent = bits.length
-    ? `${p.displayName} — ${bits.join(" ")}`
-    : p.displayName;
-
-  renderBadges(card);
-  renderStats(series);
-  renderChart(cardId, series);
-
-  if (els.cardSelect.value !== cardId) els.cardSelect.value = cardId;
-}
-
-function populateSelectFromList(list) {
+function populateCardDropdown(listOfBaseNames) {
   els.cardSelect.innerHTML = "";
-  for (const card of list) {
+  for (const name of listOfBaseNames) {
     const opt = document.createElement("option");
-    opt.value = card.name; // internal id
-    opt.textContent = makeOptionText(card);
+    opt.value = name;
+    opt.textContent = name;
     els.cardSelect.appendChild(opt);
   }
 }
 
-/** -------- Search behaviour: search by base name -------- **/
-function filterCardsBySearch(query) {
-  const q = (query || "").trim().toLowerCase();
-  if (!q) return cards;
-
-  // match against base display name and also the full label
-  return cards.filter(c => {
-    const p = c._parsed || parseLabel(c.name);
-    return p.displayName.toLowerCase().includes(q) || String(c.name).toLowerCase().includes(q);
+function populatePrintingDropdown(baseName) {
+  const printings = (printingsByBase.get(baseName) || []).slice();
+  // stable sort: set then collector then lang then finish
+  printings.sort((a, b) => {
+    const ak = `${a.set || ""}|${a.collector || ""}|${a.lang || ""}|${a.finish || ""}`;
+    const bk = `${b.set || ""}|${b.collector || ""}|${b.lang || ""}|${b.finish || ""}`;
+    return ak.localeCompare(bk);
   });
+
+  els.printingSelect.innerHTML = "";
+  for (const p of printings) {
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.printable || p.id;
+    els.printingSelect.appendChild(opt);
+  }
+
+  // choose first by default if current selection isn’t valid
+  if (!printings.find(p => p.id === selectedPrintingId)) {
+    selectedPrintingId = printings[0]?.id || null;
+  }
+
+  els.printingSelect.value = selectedPrintingId || "";
 }
 
-function renderMoversDemo() {
-  const demo = [
-    "Smothering Tithe: +£2.70 (demo)",
-    "The One Ring: +£4.10 (demo)",
-    "Orcish Bowmasters: -£1.20 (demo)",
-  ];
+function applyViewState() {
+  const mode = els.viewMode.value; // combined | printing
+  const printings = printingsByBase.get(selectedBase) || [];
+
+  const hasMultiplePrintings = printings.length > 1;
+
+  // Only enable printing selector if user chooses printing view AND there is > 1 printing
+  const printingMode = (mode === "printing") && hasMultiplePrintings;
+  els.printingSelect.disabled = !printingMode;
+
+  if (mode === "combined" || !hasMultiplePrintings) {
+    const combined = buildCombinedSeries(selectedBase);
+    els.cardTitle.textContent = `${selectedBase} — Combined`;
+    renderBadgesForCombined(selectedBase);
+    renderStats(combined);
+    renderChart(`${selectedBase} (Combined)`, combined);
+    return;
+  }
+
+  // printing mode
+  populatePrintingDropdown(selectedBase);
+  const printing = printings.find(p => p.id === selectedPrintingId) || printings[0];
+  const series = pricesById[printing.id] || [];
+
+  const titleBits = printing.printable ? printing.printable : printing.id;
+  els.cardTitle.textContent = `${selectedBase} — ${titleBits}`;
+  renderBadgesForPrinting(printing);
+  renderStats(series);
+  renderChart(`${selectedBase} (${titleBits})`, series);
+}
+
+function setSelectedBase(name) {
+  selectedBase = name;
+  els.cardSelect.value = name;
+
+  // default view mode stays as chosen; but if only one printing, force printing selector disabled
+  const printings = printingsByBase.get(selectedBase) || [];
+  if (printings.length === 1) {
+    selectedPrintingId = printings[0].id;
+    // optional: keep combined default anyway; we’ll still show combined unless user switches to printing
+  }
+
+  // Ensure printing dropdown is populated if needed
+  populatePrintingDropdown(selectedBase);
+  applyViewState();
+}
+
+/** ---------- Movers placeholder (Step 3 will replace this) ---------- **/
+function renderMoversPlaceholder() {
   els.movers.innerHTML = "";
-  demo.forEach(t => {
-    const li = document.createElement("li");
-    li.textContent = t;
-    els.movers.appendChild(li);
-  });
+  const li = document.createElement("li");
+  li.textContent = "Next: this will become real top movers (7-day) computed from history.";
+  els.movers.appendChild(li);
 }
 
 async function loadJson(path) {
@@ -298,35 +362,49 @@ async function loadJson(path) {
 }
 
 async function init() {
-  renderMoversDemo();
+  renderMoversPlaceholder();
 
   [cards, pricesById] = await Promise.all([
     loadJson("./data/cards.json"),
     loadJson("./data/prices.json"),
   ]);
 
-  // attach parsed label info for display grouping
-  cards = cards.map(c => ({ ...c, _parsed: parseLabel(c.name) }));
+  // Parse printings
+  const printings = cards.map(c => parseLabel(c.name));
 
-  // sort by base name then by full label
-  cards.sort((a, b) => {
-    const an = (a._parsed?.displayName || a.name).toLowerCase();
-    const bn = (b._parsed?.displayName || b.name).toLowerCase();
-    if (an !== bn) return an.localeCompare(bn);
-    return String(a.name).localeCompare(String(b.name));
+  // Group by base name
+  printingsByBase = new Map();
+  for (const p of printings) {
+    if (!printingsByBase.has(p.baseName)) printingsByBase.set(p.baseName, []);
+    printingsByBase.get(p.baseName).push(p);
+  }
+
+  baseNames = Array.from(printingsByBase.keys()).sort((a, b) => a.localeCompare(b));
+  populateCardDropdown(baseNames);
+
+  // Default selection
+  const first = baseNames[0];
+  setSelectedBase(first);
+
+  // Events
+  els.cardSelect.addEventListener("change", (e) => setSelectedBase(e.target.value));
+
+  els.viewMode.addEventListener("change", () => applyViewState());
+
+  els.printingSelect.addEventListener("change", (e) => {
+    selectedPrintingId = e.target.value;
+    applyViewState();
   });
 
-  populateSelectFromList(cards);
-
-  const firstId = cards[0]?.name || Object.keys(pricesById)[0];
-  if (firstId) setSelectedCardById(firstId);
-
-  els.cardSelect.addEventListener("change", (e) => setSelectedCardById(e.target.value));
-
   els.cardSearch.addEventListener("input", (e) => {
-    const filtered = filterCardsBySearch(e.target.value);
-    populateSelectFromList(filtered);
-    if (filtered.length) setSelectedCardById(filtered[0].name);
+    const q = (e.target.value || "").trim().toLowerCase();
+    const filtered = !q
+      ? baseNames
+      : baseNames.filter(n => n.toLowerCase().includes(q));
+
+    populateCardDropdown(filtered);
+
+    if (filtered.length) setSelectedBase(filtered[0]);
   });
 }
 

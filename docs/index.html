@@ -19,11 +19,20 @@
         </div>
 
         <div class="controls">
-          <label class="label" for="cardSearch">Search</label>
-          <input id="cardSearch" class="input" type="search" placeholder="Type a card name…" autocomplete="off" />
+            <label class="label" for="cardSearch">Search</label>
+            <input id="cardSearch" class="input" type="search" placeholder="Type a card name…" autocomplete="off" />
 
-          <label class="label" for="cardSelect">Card</label>
-          <select id="cardSelect" class="select"></select>
+            <label class="label" for="cardSelect">Card</label>
+            <select id="cardSelect" class="select"></select>
+
+            <label class="label" for="viewMode">View</label>
+            <select id="viewMode" class="select">
+                <option value="combined" selected>Combined (default)</option>
+                <option value="printing">Specific printing</option>
+            </select>
+
+            <label class="label" for="printingSelect">Printing</label>
+            <select id="printingSelect" class="select" disabled></select>
         </div>
       </div>
     </header>
