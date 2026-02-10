@@ -466,11 +466,15 @@ def main() -> None:
 
     # Gate to run times unless this is a baseline run caused by CSV change.
     if not should_run_now(args.tz, args.run_times):
-        if args.baseline_on_csv_change and csv_changed:
+        # Allow dashboard export even outside scheduled times
+        if args.export_dashboard:
+            print("Outside scheduled run time, but exporting dashboard.")
+        elif args.baseline_on_csv_change and csv_changed:
             pass
         else:
             print("Not a scheduled run time; exiting.")
             return
+
 
     # FX rate (GBP per EUR)
     try:
