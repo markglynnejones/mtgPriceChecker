@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en-GB">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>MTG Price Dashboard</title>
+    <link rel="stylesheet" href="./styles.css" />
+
+    <!-- Chart.js via CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  </head>
+
+  <body>
+    <header class="header">
+      <div class="container">
+        <div class="title">
+          <h1>MTG Price Dashboard</h1>
+          <p class="subtle">Static price-history view (GitHub Pages friendly)</p>
+        </div>
+
+        <div class="controls">
+          <label class="label" for="cardSearch">Search</label>
+          <input id="cardSearch" class="input" type="search" placeholder="Type a card name…" autocomplete="off" />
+
+          <label class="label" for="cardSelect">Card</label>
+          <select id="cardSelect" class="select"></select>
+        </div>
+      </div>
+    </header>
+
+    <main class="container main">
+      <section class="panel">
+        <div class="panelHeader">
+          <h2 id="cardTitle">Loading…</h2>
+          <div class="badges" id="cardBadges"></div>
+        </div>
+
+        <div class="stats" id="stats">
+          <div class="stat">
+            <div class="statLabel">Current</div>
+            <div class="statValue" id="statCurrent">—</div>
+          </div>
+          <div class="stat">
+            <div class="statLabel">7-day change</div>
+            <div class="statValue" id="stat7d">—</div>
+          </div>
+          <div class="stat">
+            <div class="statLabel">All-time high</div>
+            <div class="statValue" id="statAth">—</div>
+          </div>
+          <div class="stat">
+            <div class="statLabel">Data points</div>
+            <div class="statValue" id="statCount">—</div>
+          </div>
+        </div>
+
+        <div class="chartWrap">
+          <canvas id="priceChart" height="120"></canvas>
+        </div>
+
+        <div class="footerNote" id="footerNote"></div>
+      </section>
+
+      <section class="panel">
+        <h3>Top movers (demo)</h3>
+        <p class="subtle">
+          This section is placeholder for a “biggest weekly movers” list once we wire real data exports.
+        </p>
+        <ul id="movers" class="list"></ul>
+      </section>
+    </main>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

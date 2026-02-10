@@ -29,7 +29,7 @@ jobs:
       - name: Run tracker
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python tracker.py --csv collection/moxfield.csv --tz Europe/London --run-times 07:00,19:00 --baseline-on-csv-change --trend_window 14 --trend_spike_pct 25 --trend_dip_pct -20 --trend_min_points 6
+        run: python tracker.py --csv collection/moxfield.csv --tz Europe/London --run-times 07:00,19:00 --baseline-on-csv-change --export-dashboard
 
       - name: Commit updated snapshots and summaries
         run: |

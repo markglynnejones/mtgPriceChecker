@@ -11,6 +11,8 @@ import pandas as pd
 import requests
 from zoneinfo import ZoneInfo
 
+from pathlib import Path
+
 
 SCRYFALL_COLLECTION_URL = "https://api.scryfall.com/cards/collection"
 HISTORY_PATH = "data/history.json"
@@ -286,6 +288,118 @@ def write_weekly_summary_csv(
     df.to_csv(out_path, index=False, encoding="utf-8")
 
 
+# -------- Dashboard export (Option 4) --------
+
+def _date_yyyy_mm_dd_from_iso(ts: str) -> str | None:
+    """
+    Convert an ISO timestamp (e.g. 2026-02-09T19:00:00+00:00) to YYYY-MM-DD.
+    """
+    if not isinstance(ts, str) or not ts.strip():
+        return None
+    try:
+        # Python's fromisoformat handles offsets like +00:00
+        dt = datetime.fromisoformat(ts)
+        return dt.date().isoformat()
+    except Exception:
+        # fallback: take first 10 chars if it looks like YYYY-MM-DD
+        if len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
+            return ts[:10]
+        return None
+
+
+def _dashboard_label(info: Dict[str, Any]) -> str:
+    """
+    Produce a unique, human-friendly key for the dashboard that matches the Step 1 UI.
+    (If you want name-only later, we can add aggregation, but this avoids collisions.)
+    """
+    name = str(info.get("name") or "").strip()
+    set_code = str(info.get("set") or "").upper()
+    cn = str(info.get("collector_number") or "").strip()
+    lang = str(info.get("lang") or "").strip()
+    fk = str(info.get("foil_kind") or "").strip()
+    return f"{name} ({set_code} #{cn} {lang} {fk})".strip()
+
+
+def export_dashboard_from_history(
+    *,
+    history: Dict[str, List[Dict[str, Any]]],
+    curr_cards: Dict[str, Any],
+    out_dir: str = "docs/data",
+) -> Tuple[str, str, int, int]:
+    """
+    Uses data/history.json (already time-series) + current card metadata to export:
+      - docs/data/prices.json : { "<label>": [{"date": "YYYY-MM-DD", "price": <gbp>} ...] }
+      - docs/data/cards.json  : [{"name": "<label>", "set": "...", "rarity": "...", "finish": "..."} ...]
+
+    Price selection:
+      - prefer gbp if present in history entries
+      - else fall back to eur (still stored in "price")
+    """
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    prices_by_card: Dict[str, List[Dict[str, Any]]] = {}
+    cards_meta: Dict[str, Dict[str, Any]] = {}
+
+    # Map internal key -> dashboard label (stable for this export)
+    key_to_label: Dict[str, str] = {}
+    for k, info in curr_cards.items():
+        label = _dashboard_label(info)
+        key_to_label[k] = label
+        if label not in cards_meta:
+            cards_meta[label] = {
+                "name": label,
+                "set": info.get("set"),
+                "rarity": info.get("rarity"),
+                "finish": info.get("foil_kind"),
+            }
+
+    # Build time series
+    for k, entries in history.items():
+        label = key_to_label.get(k)
+        if not label:
+            continue  # prune keys not in current collection (you already prune history, so rare)
+        if not isinstance(entries, list):
+            continue
+
+        per_day: Dict[str, float] = {}
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            day = _date_yyyy_mm_dd_from_iso(e.get("ts"))
+            if not day:
+                continue
+
+            gbp = safe_float(e.get("gbp"))
+            eur = safe_float(e.get("eur"))
+            price = gbp if gbp is not None else eur
+            if price is None:
+                continue
+
+            # keep last value for that date
+            per_day[day] = float(price)
+
+        if not per_day:
+            continue
+
+        series = [{"date": d, "price": per_day[d]} for d in sorted(per_day.keys())]
+        prices_by_card[label] = series
+
+    cards = list(cards_meta.values())
+    cards.sort(key=lambda x: (x.get("name") or "").lower())
+
+    prices_out = out_path / "prices.json"
+    cards_out = out_path / "cards.json"
+
+    with open(prices_out, "w", encoding="utf-8") as f:
+        json.dump(prices_by_card, f, ensure_ascii=False, indent=2)
+
+    with open(cards_out, "w", encoding="utf-8") as f:
+        json.dump(cards, f, ensure_ascii=False, indent=2)
+
+    return str(prices_out), str(cards_out), len(cards), len(prices_by_card)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", required=True, help="Path(s) to Moxfield export CSV. Single file or comma-separated list.")
@@ -319,6 +433,12 @@ def main() -> None:
     ap.add_argument("--trend_spike_pct", type=float, default=20.0, help="Trend spike threshold percent over average")
     ap.add_argument("--trend_dip_pct", type=float, default=-15.0, help="Trend dip threshold percent under average")
     ap.add_argument("--trend_min_points", type=int, default=6, help="Minimum data points required for trend alerts")
+
+    # Dashboard export (Option 4)
+    ap.add_argument("--export-dashboard", action="store_true",
+                    help="Export docs/data/prices.json and docs/data/cards.json for GitHub Pages dashboard")
+    ap.add_argument("--dashboard-out-dir", default="docs/data",
+                    help="Dashboard output dir (default: docs/data)")
 
     args = ap.parse_args()
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
@@ -479,6 +599,10 @@ def main() -> None:
         current["_meta"]["run_type"] = "baseline"
         current["_meta"]["suppress_next_no_alerts"] = True
         save_snapshot(args.snapshot, current)
+
+        # Export dashboard too (useful immediately after baseline refresh)
+        if args.export_dashboard:
+            export_dashboard_from_history(history=history, curr_cards=curr_cards, out_dir=args.dashboard_out_dir)
 
         if webhook:
             tz = ZoneInfo(args.tz)
@@ -675,6 +799,15 @@ def main() -> None:
 
     # Save snapshot for next run
     save_snapshot(args.snapshot, current)
+
+    # Export dashboard files (Option 4)
+    if args.export_dashboard:
+        prices_out, cards_out, card_count, series_count = export_dashboard_from_history(
+            history=history,
+            curr_cards=curr_cards,
+            out_dir=args.dashboard_out_dir,
+        )
+        print(f"[dashboard] wrote {prices_out} and {cards_out} ({card_count} cards, {series_count} series)")
 
 
 if __name__ == "__main__":
