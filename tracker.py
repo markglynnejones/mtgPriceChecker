@@ -174,14 +174,22 @@ def eur_to_gbp_rate() -> float | None:
     return None
 
 
+# OPTION A: hour-based gating (so 07:55 counts as the 07 run)
 def should_run_now(tz_name: str, run_times_csv: str) -> bool:
     if not run_times_csv.strip():
         return True
     tz = ZoneInfo(tz_name)
     now_local = datetime.now(tz)
-    now_hm = now_local.strftime("%H:%M")
-    allowed = {t.strip() for t in run_times_csv.split(",") if t.strip()}
-    return now_hm in allowed
+    allowed_hours = set()
+    for t in run_times_csv.split(","):
+        t = t.strip()
+        if not t:
+            continue
+        try:
+            allowed_hours.add(int(t.split(":")[0]))
+        except Exception:
+            continue
+    return now_local.hour in allowed_hours
 
 
 def parse_weekday(s: str) -> int:
@@ -283,6 +291,7 @@ def write_weekly_summary_csv(
     df = pd.DataFrame(rows)
     df.sort_values(by=["name", "set", "collector_number", "foil_kind"], inplace=True, kind="mergesort")
     df.to_csv(out_path, index=False, encoding="utf-8")
+
 
 def write_export_snapshot_csv(
     out_path: str,
@@ -456,7 +465,6 @@ def main() -> None:
     # Skip alert computation entirely (still updates snapshot/history; useful for weekly exports)
     ap.add_argument("--no-alerts", action="store_true", help="Do not compute alerts (export/snapshot only)")
 
-
     args = ap.parse_args()
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -482,8 +490,9 @@ def main() -> None:
 
     # Determine scheduled status once (do not recompute later)
     is_scheduled_time = should_run_now(args.tz, args.run_times)
-    allow_discord = bool(webhook) and (not args.no_discord) and (not args.no_alerts) and is_scheduled_time
 
+    # Allow Discord posting only for scheduled runs (and not disabled)
+    allow_discord = bool(webhook) and (not args.no_discord) and (not args.no_alerts) and is_scheduled_time
 
     # Gate to run times unless this is a baseline run caused by CSV change,
     # OR this is a dashboard export run (manual refresh),
@@ -613,6 +622,7 @@ def main() -> None:
         time.sleep(0.12)
 
     curr_cards = current["cards"]
+
     # Export a full snapshot CSV if requested
     if args.export_csv:
         write_export_snapshot_csv(
@@ -786,8 +796,11 @@ def main() -> None:
         fx_line = f"FX: 1 EUR = {rate:.4f} GBP" if rate is not None else "FX: unavailable"
         header = f"🧾 MTG price watch — {now_local.strftime('%Y-%m-%d %H:%M')} ({args.tz})\n{fx_line}"
 
+        posted_anything = False
+
         if sell_candidates:
             discord_post(webhook, header + f"\nSell candidates: {len(sell_candidates)}")
+            posted_anything = True
             msg = ""
             for a in sell_candidates:
                 if len(msg) + len(a) + 2 > 1800:
@@ -800,6 +813,7 @@ def main() -> None:
 
         if buy_more_signals:
             discord_post(webhook, header + f"\nBuy-more signals: {len(buy_more_signals)}")
+            posted_anything = True
             msg = ""
             for a in buy_more_signals:
                 if len(msg) + len(a) + 2 > 1800:
@@ -812,6 +826,7 @@ def main() -> None:
 
         if trend_alerts:
             discord_post(webhook, header + f"\nTrend alerts: {len(trend_alerts)}")
+            posted_anything = True
             msg = ""
             for a in trend_alerts:
                 if len(msg) + len(a) + 2 > 1800:
@@ -824,6 +839,7 @@ def main() -> None:
 
         if alerts:
             discord_post(webhook, header + f"\nAlerts: {len(alerts)}")
+            posted_anything = True
             msg = ""
             for a in alerts:
                 if len(msg) + len(a) + 2 > 1800:
@@ -841,9 +857,15 @@ def main() -> None:
                     current["_meta"]["suppress_next_no_alerts"] = False
                 else:
                     discord_post(webhook, header + "\nNo alerts today.")
+                    posted_anything = True
             else:
                 if prev_suppress_next_no_alerts:
                     current["_meta"]["suppress_next_no_alerts"] = False
+
+        # Heartbeat: always tell you it ran (even if nothing triggered)
+        if not posted_anything:
+            discord_post(webhook, header + "\n✅ Ran successfully — nothing to report.")
+            # posted_anything = True  # not needed after this
 
     # Save snapshot for next run
     save_snapshot(args.snapshot, current)
