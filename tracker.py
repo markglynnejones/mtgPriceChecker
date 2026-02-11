@@ -284,6 +284,37 @@ def write_weekly_summary_csv(
     df.sort_values(by=["name", "set", "collector_number", "foil_kind"], inplace=True, kind="mergesort")
     df.to_csv(out_path, index=False, encoding="utf-8")
 
+def write_export_snapshot_csv(
+    out_path: str,
+    cards: Dict[str, Any],
+    rate_gbp_per_eur: float | None,
+) -> None:
+    rows = []
+    for _, info in cards.items():
+        eur = safe_float(info.get("eur"))
+        gbp = (eur * rate_gbp_per_eur) if (eur is not None and rate_gbp_per_eur is not None) else None
+
+        rows.append({
+            "name": info.get("name"),
+            "set": info.get("set"),
+            "collector_number": info.get("collector_number"),
+            "lang": info.get("lang"),
+            "foil_kind": info.get("foil_kind"),
+            "qty": info.get("qty"),
+            "eur": eur,
+            "gbp": gbp,
+            "risk": info.get("risk"),
+            "reserved_list": info.get("reserved_list"),
+            "released_year": info.get("released_year"),
+            "scryfall_uri": info.get("scryfall_uri"),
+            "cardmarket_url": info.get("cardmarket_url"),
+        })
+
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    df = pd.DataFrame(rows)
+    df.sort_values(by=["name", "set", "collector_number", "foil_kind"], inplace=True, kind="mergesort")
+    df.to_csv(out_path, index=False, encoding="utf-8")
+
 
 # -------- Dashboard export (Option 4) --------
 
@@ -419,6 +450,13 @@ def main() -> None:
     # Hard safety: allow manual runs without Discord spam
     ap.add_argument("--no-discord", action="store_true", help="Do not post alerts to Discord")
 
+    # Export a full snapshot CSV (for weekly upload / manual exports)
+    ap.add_argument("--export-csv", default="", help="Write a full snapshot CSV to this path (no deltas)")
+
+    # Skip alert computation entirely (still updates snapshot/history; useful for weekly exports)
+    ap.add_argument("--no-alerts", action="store_true", help="Do not compute alerts (export/snapshot only)")
+
+
     args = ap.parse_args()
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -444,13 +482,17 @@ def main() -> None:
 
     # Determine scheduled status once (do not recompute later)
     is_scheduled_time = should_run_now(args.tz, args.run_times)
-    allow_discord = bool(webhook) and (not args.no_discord) and is_scheduled_time
+    allow_discord = bool(webhook) and (not args.no_discord) and (not args.no_alerts) and is_scheduled_time
+
 
     # Gate to run times unless this is a baseline run caused by CSV change,
-    # OR this is a dashboard export run (manual refresh).
+    # OR this is a dashboard export run (manual refresh),
+    # OR this is a snapshot CSV export run.
     if not is_scheduled_time:
         if args.export_dashboard:
             print("Outside scheduled run time, but exporting dashboard.")
+        elif args.export_csv:
+            print("Outside scheduled run time, but exporting snapshot CSV.")
         elif args.baseline_on_csv_change and csv_changed:
             pass
         else:
@@ -571,6 +613,13 @@ def main() -> None:
         time.sleep(0.12)
 
     curr_cards = current["cards"]
+    # Export a full snapshot CSV if requested
+    if args.export_csv:
+        write_export_snapshot_csv(
+            out_path=args.export_csv,
+            cards=curr_cards,
+            rate_gbp_per_eur=rate,
+        )
 
     # ---- Update trend history (always) ----
     history = load_history(HISTORY_PATH)
@@ -603,6 +652,19 @@ def main() -> None:
                 f"Time: {now_local.strftime('%Y-%m-%d %H:%M')} ({args.tz})\n"
                 f"Alerts will resume on the next scheduled run (07:00 or 19:00)."
             )
+        return
+
+    # If we're in export-only mode, skip alert generation/posting and just save snapshot (+ optional dashboard)
+    if args.no_alerts:
+        save_snapshot(args.snapshot, current)
+
+        if args.export_dashboard:
+            prices_out, cards_out, card_count, series_count = export_dashboard_from_history(
+                history=history,
+                curr_cards=curr_cards,
+                out_dir=args.dashboard_out_dir,
+            )
+            print(f"[dashboard] wrote {prices_out} and {cards_out} ({card_count} cards, {series_count} series)")
         return
 
     def get_prev_eur(k: str) -> float | None:

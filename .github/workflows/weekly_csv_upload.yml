@@ -1,0 +1,41 @@
+name: Weekly CSV Upload
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 18 * * 0"  # Sunday 18:00 Europe/London
+
+permissions:
+  contents: read
+
+jobs:
+  weekly-upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Generate weekly snapshot CSV
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python tracker.py \
+            --csv collection/moxfield.csv \
+            --tz Europe/London \
+            --export-csv data/weekly/weekly_snapshot_latest.csv \
+            --no-alerts \
+            --no-discord
+
+      - name: Upload CSV to Discord
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python weekly_upload.py --file data/weekly/weekly_snapshot_latest.csv --tz Europe/London
