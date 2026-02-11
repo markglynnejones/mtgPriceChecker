@@ -5,18 +5,15 @@ import os
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
 import pandas as pd
 import requests
 from zoneinfo import ZoneInfo
 
-from pathlib import Path
-
-
 SCRYFALL_COLLECTION_URL = "https://api.scryfall.com/cards/collection"
 HISTORY_PATH = "data/history.json"
-
 
 LANG_MAP = {
     "English": "en",
@@ -291,27 +288,18 @@ def write_weekly_summary_csv(
 # -------- Dashboard export (Option 4) --------
 
 def _date_yyyy_mm_dd_from_iso(ts: str) -> str | None:
-    """
-    Convert an ISO timestamp (e.g. 2026-02-09T19:00:00+00:00) to YYYY-MM-DD.
-    """
     if not isinstance(ts, str) or not ts.strip():
         return None
     try:
-        # Python's fromisoformat handles offsets like +00:00
         dt = datetime.fromisoformat(ts)
         return dt.date().isoformat()
     except Exception:
-        # fallback: take first 10 chars if it looks like YYYY-MM-DD
         if len(ts) >= 10 and ts[4] == "-" and ts[7] == "-":
             return ts[:10]
         return None
 
 
 def _dashboard_label(info: Dict[str, Any]) -> str:
-    """
-    Produce a unique, human-friendly key for the dashboard that matches the Step 1 UI.
-    (If you want name-only later, we can add aggregation, but this avoids collisions.)
-    """
     name = str(info.get("name") or "").strip()
     set_code = str(info.get("set") or "").upper()
     cn = str(info.get("collector_number") or "").strip()
@@ -326,22 +314,12 @@ def export_dashboard_from_history(
     curr_cards: Dict[str, Any],
     out_dir: str = "docs/data",
 ) -> Tuple[str, str, int, int]:
-    """
-    Uses data/history.json (already time-series) + current card metadata to export:
-      - docs/data/prices.json : { "<label>": [{"date": "YYYY-MM-DD", "price": <gbp>} ...] }
-      - docs/data/cards.json  : [{"name": "<label>", "set": "...", "rarity": "...", "finish": "..."} ...]
-
-    Price selection:
-      - prefer gbp if present in history entries
-      - else fall back to eur (still stored in "price")
-    """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     prices_by_card: Dict[str, List[Dict[str, Any]]] = {}
     cards_meta: Dict[str, Dict[str, Any]] = {}
 
-    # Map internal key -> dashboard label (stable for this export)
     key_to_label: Dict[str, str] = {}
     for k, info in curr_cards.items():
         label = _dashboard_label(info)
@@ -354,11 +332,10 @@ def export_dashboard_from_history(
                 "finish": info.get("foil_kind"),
             }
 
-    # Build time series
     for k, entries in history.items():
         label = key_to_label.get(k)
         if not label:
-            continue  # prune keys not in current collection (you already prune history, so rare)
+            continue
         if not isinstance(entries, list):
             continue
 
@@ -376,7 +353,6 @@ def export_dashboard_from_history(
             if price is None:
                 continue
 
-            # keep last value for that date
             per_day[day] = float(price)
 
         if not per_day:
@@ -440,6 +416,9 @@ def main() -> None:
     ap.add_argument("--dashboard-out-dir", default="docs/data",
                     help="Dashboard output dir (default: docs/data)")
 
+    # Hard safety: allow manual runs without Discord spam
+    ap.add_argument("--no-discord", action="store_true", help="Do not post alerts to Discord")
+
     args = ap.parse_args()
     webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 
@@ -463,9 +442,13 @@ def main() -> None:
 
     csv_changed = (prev_hash != csv_hash)
 
-    # Gate to run times unless this is a baseline run caused by CSV change.
-    if not should_run_now(args.tz, args.run_times):
-        # Allow dashboard export even outside scheduled times
+    # Determine scheduled status once (do not recompute later)
+    is_scheduled_time = should_run_now(args.tz, args.run_times)
+    allow_discord = bool(webhook) and (not args.no_discord) and is_scheduled_time
+
+    # Gate to run times unless this is a baseline run caused by CSV change,
+    # OR this is a dashboard export run (manual refresh).
+    if not is_scheduled_time:
         if args.export_dashboard:
             print("Outside scheduled run time, but exporting dashboard.")
         elif args.baseline_on_csv_change and csv_changed:
@@ -473,7 +456,6 @@ def main() -> None:
         else:
             print("Not a scheduled run time; exiting.")
             return
-
 
     # FX rate (GBP per EUR)
     try:
@@ -537,10 +519,10 @@ def main() -> None:
         r = requests.post(SCRYFALL_COLLECTION_URL, json=payload, timeout=60)
         r.raise_for_status()
         data = r.json()
-        cards = data.get("data", [])
+        cards_data = data.get("data", [])
 
         by_id: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-        for c in cards:
+        for c in cards_data:
             set_code = str(c.get("set", "")).lower()
             collector_number = str(c.get("collector_number", "")).strip()
             lang = str(c.get("lang", "en")).lower()
@@ -590,10 +572,9 @@ def main() -> None:
 
     curr_cards = current["cards"]
 
-    # ---- Update trend history (always, even for baseline runs) ----
+    # ---- Update trend history (always) ----
     history = load_history(HISTORY_PATH)
     history = update_history(history, curr_cards, rate, now_iso, args.trend_window)
-    # Prune history for cards no longer in collection (prevents bloat)
     history = {k: v for k, v in history.items() if k in curr_cards}
     save_history(HISTORY_PATH, history)
 
@@ -604,7 +585,6 @@ def main() -> None:
         current["_meta"]["suppress_next_no_alerts"] = True
         save_snapshot(args.snapshot, current)
 
-        # Export dashboard too (useful immediately after baseline refresh)
         if args.export_dashboard:
             prices_out, cards_out, card_count, series_count = export_dashboard_from_history(
                 history=history,
@@ -613,7 +593,8 @@ def main() -> None:
             )
             print(f"[dashboard] wrote {prices_out} and {cards_out} ({card_count} cards, {series_count} series)")
 
-        if webhook:
+        # IMPORTANT: baseline runs should not spam Discord (only allow at scheduled times + not --no-discord)
+        if allow_discord:
             tz = ZoneInfo(args.tz)
             now_local = datetime.now(tz)
             discord_post(
@@ -653,7 +634,6 @@ def main() -> None:
         money_now = fmt_money_gbp_first(eur, gbp)
         money_prev = fmt_money_gbp_first(prev_eur, prev_gbp)
 
-        # Base spike/dip alerts
         if (pct >= args.spike_pct) or (delta_eur >= args.spike_abs_eur):
             alerts.append(
                 f"📈 **PRICE SPIKE**\n"
@@ -674,7 +654,6 @@ def main() -> None:
                 f"{links}"
             )
 
-        # Sell candidate
         is_sell = (pct >= args.sell_candidate_pct) or (delta_gbp is not None and delta_gbp >= args.sell_candidate_abs_gbp)
         if is_sell:
             dgbp = f"{delta_gbp:+.2f}" if delta_gbp is not None else "n/a"
@@ -686,7 +665,6 @@ def main() -> None:
                 f"{links}"
             )
 
-        # Buy-more signal
         if pct <= args.buy_more_pct:
             dgbp = f"{delta_gbp:+.2f}" if delta_gbp is not None else "n/a"
             buy_more_signals.append(
@@ -697,7 +675,6 @@ def main() -> None:
                 f"{links}"
             )
 
-        # Trend spike/dip vs moving average
         hist = history.get(k, [])
         if len(hist) >= args.trend_min_points:
             avg_eur, avg_gbp = moving_average(hist)
@@ -706,7 +683,7 @@ def main() -> None:
                 avg_money = fmt_money_gbp_first(avg_eur, avg_gbp)
 
                 spike_mult = 1.0 + (args.trend_spike_pct / 100.0)
-                dip_mult = 1.0 + (args.trend_dip_pct / 100.0)  # dip pct is negative by default
+                dip_mult = 1.0 + (args.trend_dip_pct / 100.0)
 
                 if eur >= avg_eur * spike_mult:
                     trend_alerts.append(
@@ -740,8 +717,8 @@ def main() -> None:
             prev_cards=prev_cards,
         )
 
-    # Discord posting
-    if webhook:
+    # Discord posting (ONLY at scheduled times and only if not --no-discord)
+    if allow_discord:
         tz = ZoneInfo(args.tz)
         now_local = datetime.now(tz)
         fx_line = f"FX: 1 EUR = {rate:.4f} GBP" if rate is not None else "FX: unavailable"
